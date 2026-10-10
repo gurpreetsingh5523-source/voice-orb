@@ -1,0 +1,326 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Voice Orb</title>
+<!-- Voice Orb. Copyright (c) 2026 Gurpreet Singh Dhillon (Nam-toon Studio). All rights reserved. See LICENSE. -->
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; background: #05070d; overflow: hidden;
+               font: 14px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #cfe0ff; }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+  #bar { position: fixed; left: 0; right: 0; bottom: max(18px, env(safe-area-inset-bottom));
+         display: flex; gap: 10px; justify-content: center; align-items: center; flex-wrap: wrap; padding: 0 16px; }
+  button, select { font: inherit; color: #e8f0ff; background: rgba(120,160,255,0.12);
+         border: 1px solid rgba(150,185,255,0.35); border-radius: 999px; padding: 9px 18px; cursor: pointer; }
+  button:hover, select:hover { background: rgba(120,160,255,0.22); }
+  button:focus-visible, select:focus-visible { outline: 2px solid #9fc0ff; outline-offset: 2px; }
+  #note { position: fixed; top: 18px; left: 0; right: 0; text-align: center; opacity: 0.7; padding: 0 16px; }
+</style>
+</head>
+<body>
+<canvas id="c" aria-label="A sphere of glowing particles that moves with sound"></canvas>
+<div id="note" role="status">Demo sound is playing the orb. Press "Use microphone" to drive it with your voice.</div>
+<div id="bar">
+  <button id="mic" type="button">Use microphone</button>
+  <label>Colour
+    <select id="colour">
+      <option value="110,170,255">Blue</option>
+      <option value="120,230,190">Green</option>
+      <option value="255,190,110">Amber</option>
+      <option value="200,150,255">Violet</option>
+      <option value="255,130,150">Rose</option>
+    </select>
+  </label>
+  <label>Stars
+    <select id="stars"><option value="1">On</option><option value="0">Off</option></select>
+  </label>
+</div>
+<script>
+"use strict";
+const canvas = document.getElementById("c");
+const g2d = canvas.getContext("2d");
+const note = document.getElementById("note");
+const reducedMotion = !!(window.matchMedia && matchMedia("(prefers-reduced-motion: reduce)").matches);
+
+/* small seeded random generator, so the orb looks the same on every load */
+function mulberry32(seed) {
+  return function () {
+    seed |= 0; seed = (seed + 0x6D2B79F5) | 0;
+    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/* ---- sound: three bands (low / mid / high), each 0..1 ----------------------
+ * With the microphone on, the bands come from an AnalyserNode. Without it a
+ * built-in demo signal plays the orb, so the page moves as soon as it opens.
+ * Audio is analysed in the page only; nothing is recorded or sent anywhere.
+ */
+window.__bands = [0, 0, 0];
+const bandT = [0, 0, 0];
+let analyser = null, freqBuf = null, timeBuf = null, level = 0;
+
+async function startMic() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const ac = new (window.AudioContext || window.webkitAudioContext)();
+    const an = ac.createAnalyser();
+    an.fftSize = 512; an.smoothingTimeConstant = 0.6;
+    ac.createMediaStreamSource(stream).connect(an);
+    analyser = an;
+    freqBuf = new Uint8Array(an.frequencyBinCount);
+    timeBuf = new Uint8Array(an.fftSize);
+    note.textContent = "Listening. Speak, clap or play music.";
+    document.getElementById("mic").hidden = true;
+  } catch (e) {
+    note.textContent = "No microphone access, so the demo sound keeps playing.";
+  }
+}
+document.getElementById("mic").addEventListener("click", startMic);
+
+function soundStep(dt, t) {
+  let target = 0;
+  if (analyser) {
+    analyser.getByteFrequencyData(freqBuf);
+    const n = freqBuf.length, third = Math.max(1, Math.floor(n / 3));
+    for (let b = 0; b < 3; b++) {
+      const lo = third * b, hi = b === 2 ? n : lo + third;
+      let sum = 0;
+      for (let i = lo; i < hi; i++) sum += freqBuf[i];
+      bandT[b] = Math.min(1, sum / ((hi - lo) * 255) * (b === 0 ? 1.4 : b === 1 ? 2.6 : 4.5));
+    }
+    analyser.getByteTimeDomainData(timeBuf);
+    let sq = 0;
+    for (let i = 0; i < timeBuf.length; i++) { const v = (timeBuf[i] - 128) / 128; sq += v * v; }
+    target = Math.min(1, Math.sqrt(sq / timeBuf.length) * 3.2);
+  } else if (!reducedMotion) {
+    /* demo: slow "speech" phrases with pauses */
+    const phrase = Math.max(0, Math.sin(t * 0.9)) * (0.6 + 0.4 * Math.sin(t * 0.23));
+    bandT[0] = phrase * (0.45 + 0.35 * Math.abs(Math.sin(t * 3.1)));
+    bandT[1] = phrase * (0.30 + 0.45 * Math.abs(Math.sin(t * 5.3 + 1)));
+    bandT[2] = phrase * Math.pow(Math.abs(Math.sin(t * 7.7 + 2)), 4) * 0.8;
+    target = phrase * 0.7;
+  }
+  const k = Math.min(1, dt * 10);                 // fast attack, soft decay
+  for (let i = 0; i < 3; i++) window.__bands[i] += (bandT[i] - window.__bands[i]) * k;
+  level += (target - level) * k;
+}
+
+/* ---- the orb: a sphere of ~4600 glowing particles --------------------------
+ * LOW swells the radius, MID ripples the surface, HIGH throws sparks off the
+ * edge. Positions, wave phases and twinkles are precomputed once; points are
+ * drawn batched in 6 depth buckets (one path per bucket), then the sparks.
+ * prefers-reduced-motion: radius and waves rest, no sparks, no turning.
+ */
+const vorb = (() => {
+  const COUNT = 4600;
+  const reduced = !!(window.matchMedia && matchMedia("(prefers-reduced-motion: reduce)").matches);
+  const rr = mulberry32(20261019);
+  const px = new Float32Array(COUNT), py = new Float32Array(COUNT), pz = new Float32Array(COUNT);
+  const wph = new Float32Array(COUNT), wfr = new Float32Array(COUNT);   // surface-wave phase/freq
+  const twp = new Float32Array(COUNT), twf = new Float32Array(COUNT);   // twinkle phase/freq
+  const tint = new Float32Array(COUNT);                                 // white-mix amount
+  /* uniform-ish sphere points: cos(theta) uniform in [-1,1] */
+  for (let i = 0; i < COUNT; i++) {
+    const z = 1 - 2 * (i + 0.5) / COUNT;
+    const th = Math.PI * (3 - Math.sqrt(5)) * i;                        // golden-angle spiral
+    const rxy = Math.sqrt(Math.max(0, 1 - z * z));
+    px[i] = rxy * Math.cos(th); py[i] = z; pz[i] = rxy * Math.sin(th);
+    wph[i] = rr() * Math.PI * 2; wfr[i] = 1.4 + rr() * 2.4;
+    twp[i] = rr() * Math.PI * 2; twf[i] = 0.5 + rr() * 1.4;
+    tint[i] = rr() * 0.6;
+  }
+  const SPMAX = 96;                                     // live spark pool
+  const sparks = [];
+  for (let i = 0; i < SPMAX; i++) sparks.push({ x: 0, y: 0, vx: 0, vy: 0, age: 1e9, life: 1 });
+  const BUCKETS = 6;
+  return { COUNT, reduced, px, py, pz, wph, wfr, twp, twf, tint,
+           sparks, SPMAX, BUCKETS, rot: 0, lastT: 0 };
+})();
+
+window.__particles = { count: vorb.COUNT, radius: 1, wave: 0.03, sparks: 0, frameMs: 0 };
+
+function vorbDraw(ctx, cx, cy, R, nowMs, rgb, lvl, breathe) {
+  const frameStart = performance.now();
+  const P = window.__particles;
+  const t = nowMs / 1000;
+  const dt = vorb.lastT ? Math.min(0.05, t - vorb.lastT) : 0.016;
+  vorb.lastT = t;
+  if (!vorb.reduced) vorb.rot += dt * 0.10;             // slow turn
+
+  /* the three bands drive radius / waves / sparks (fixed at rest values
+   * under reduced motion) */
+  const [lo, mid, hi] = window.__bands;
+  P.radius = vorb.reduced ? 1 : 1 + 0.45 * lo;
+  P.wave   = vorb.reduced ? 0.03 : 0.03 + 0.30 * mid;
+  const sparkTarget = vorb.reduced ? 0 : Math.round(1 + hi * 63);
+
+  /* state colour mixed toward white (a fixed white bias + per-point tint) */
+  const WB = 0.45;
+  const cr = rgb[0] + (255 - rgb[0]) * WB;
+  const cg = rgb[1] + (255 - rgb[1]) * WB;
+  const cb = rgb[2] + (255 - rgb[2]) * WB;
+
+  const Rp = R * 0.95 * P.radius;
+  const yaw = vorb.rot, cyw = Math.cos(yaw), syw = Math.sin(yaw);
+  const pitch = 0.4, cpw = Math.cos(pitch), spw = Math.sin(pitch);
+  const dist = 3.2;
+  const wAmp = P.wave, t1 = t * 0.9;
+  const NB = vorb.BUCKETS;
+  const paths = [];
+  for (let b = 0; b < NB; b++) paths[b] = new Path2D();
+  for (let i = 0; i < vorb.COUNT; i++) {
+    const wob = 1 + wAmp * Math.sin(t * vorb.wfr[i] + vorb.wph[i]);
+    const x = vorb.px[i] * wob, y = vorb.py[i] * wob, z = vorb.pz[i] * wob;
+    const x1 = x * cyw + z * syw, z1 = z * cyw - x * syw;
+    const y2 = y * cpw - z1 * spw, z2 = y * spw + z1 * cpw;
+    const s = dist / (dist - z2);
+    const sx = cx + x1 * s * Rp, sy = cy + y2 * s * Rp;
+    const depth = (z2 / 1.5 + 1) / 2;
+    const b = depth <= 0 ? 0 : depth >= 1 ? NB - 1 : (depth * NB) | 0;
+    const sz = 0.7 + depth * 1.4;
+    paths[b].moveTo(sx + sz, sy);
+    paths[b].arc(sx, sy, sz, 0, Math.PI * 2);
+  }
+  ctx.lineCap = "round";
+  for (let b = 0; b < NB; b++) {
+    const d = (b + 0.5) / NB;
+    const a = (0.06 + 0.44 * d * d) * (0.75 + lvl * 0.5);
+    const wh = 0.25 + d * 0.35;
+    const lr2 = Math.round(cr + (255 - cr) * wh);
+    const lg2 = Math.round(cg + (255 - cg) * wh);
+    const lb2 = Math.round(cb + (255 - cb) * wh);
+    ctx.fillStyle = `rgba(${lr2},${lg2},${lb2},${Math.min(1, a)})`;
+    ctx.fill(paths[b]);
+  }
+
+  /* sparks: bright points thrown off the edge, fading as they fly out */
+  let live = 0;
+  if (sparkTarget > 0) {
+    const want = Math.min(sparkTarget, vorb.SPMAX);
+    for (let i = 0; i < vorb.SPMAX && live < want; i++) {
+      const sp = vorb.sparks[i];
+      if (sp.age < sp.life) { live++; continue; }
+      const j = (Math.random() * vorb.COUNT) | 0;      // launch from a surface point
+      let dx = vorb.px[j], dy = vorb.py[j], dz = vorb.pz[j];
+      const x1 = dx * cyw + dz * syw, z1 = dz * cyw - dx * syw;
+      const y2 = dy * cpw - z1 * spw, z2 = dy * spw + z1 * cpw;
+      const s = dist / (dist - z2);
+      sp.x = cx + x1 * s * Rp; sp.y = cy + y2 * s * Rp;
+      const ex = sp.x - cx, ey = sp.y - cy;
+      const el = Math.hypot(ex, ey) || 1;
+      const spd = (30 + Math.random() * 70) * (0.5 + hi);
+      sp.vx = ex / el * spd; sp.vy = ey / el * spd;
+      sp.age = 0; sp.life = 0.4 + Math.random() * 0.8;
+      live++;
+    }
+  }
+  let drawn = 0;
+  const spPath = new Path2D();
+  for (const sp of vorb.sparks) {
+    if (sp.age >= sp.life) continue;
+    sp.age += dt; sp.x += sp.vx * dt; sp.y += sp.vy * dt;
+    const fade = 1 - sp.age / sp.life;
+    if (fade <= 0) continue;
+    drawn++;
+    const sz = 0.9 + fade * 1.3;
+    spPath.moveTo(sp.x + sz, sp.y);
+    spPath.arc(sp.x, sp.y, sz, 0, Math.PI * 2);
+  }
+  if (drawn) {
+    ctx.fillStyle = "rgba(255,255,255,0.75)";
+    ctx.fill(spPath);
+    ctx.fillStyle = `rgba(${Math.round(cr)},${Math.round(cg)},${Math.round(cb)},0.35)`;
+    ctx.fill(spPath);
+  }
+  P.sparks = drawn;
+
+  /* bright centre: white heart + soft halo in the state colour */
+  const coreR = R * (0.30 + breathe * 0.04 + lvl * 0.10) * P.radius;
+  const halo2 = ctx.createRadialGradient(cx, cy, coreR * 0.2, cx, cy, Rp * 1.4);
+  halo2.addColorStop(0, `rgba(${Math.round(cr)},${Math.round(cg)},${Math.round(cb)},0.28)`);
+  halo2.addColorStop(1, "rgba(0,0,0,0)");
+  ctx.fillStyle = halo2;
+  ctx.beginPath();
+  ctx.arc(cx, cy, Rp * 1.4, 0, Math.PI * 2);
+  ctx.fill();
+  const heart = ctx.createRadialGradient(cx, cy, 0, cx, cy, coreR);
+  heart.addColorStop(0, "rgba(255,255,255,0.95)");
+  heart.addColorStop(0.5, "rgba(255,255,255,0.55)");
+  heart.addColorStop(1, "rgba(255,255,255,0)");
+  ctx.fillStyle = heart;
+  ctx.beginPath();
+  ctx.arc(cx, cy, coreR, 0, Math.PI * 2);
+  ctx.fill();
+
+  const frameCost = performance.now() - frameStart;
+  P.frameMs = P.frameMs * 0.92 + frameCost * 0.08;
+}
+
+/* ---- 3D starfield: stars drift toward the viewer and twinkle --------------- */
+const rnd = mulberry32(7);
+const stars = [];
+function newStar(s, anyDepth) {
+  s.x = rnd() * 2 - 1; s.y = rnd() * 2 - 1;
+  s.z = anyDepth ? 0.08 + rnd() * 0.92 : 1;
+  s.size = 0.6 + rnd() * 1.2; s.tw = rnd() * Math.PI * 2; s.twf = 1.2 + rnd() * 2.6;
+  return s;
+}
+for (let i = 0; i < 220; i++) stars.push(newStar({}, true));
+
+let viewW = 0, viewH = 0;
+function resize() {
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  viewW = window.innerWidth; viewH = window.innerHeight;
+  canvas.width = Math.round(viewW * dpr); canvas.height = Math.round(viewH * dpr);
+  g2d.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+window.addEventListener("resize", resize);
+resize();
+
+const colourSel = document.getElementById("colour");
+const starsSel = document.getElementById("stars");
+let last = 0;
+function frame(nowMs) {
+  const t = nowMs / 1000;
+  const dt = last ? Math.min(0.05, t - last) : 0.016;
+  last = t;
+  soundStep(dt, t);
+
+  g2d.globalCompositeOperation = "source-over";
+  g2d.fillStyle = "#05070d";
+  g2d.fillRect(0, 0, viewW, viewH);
+  g2d.globalCompositeOperation = "lighter";
+
+  const cx = viewW / 2, cy = viewH * 0.45;
+  if (starsSel.value === "1") {
+    const warp = reducedMotion ? 0 : 0.035 + level * 0.10;
+    const F = Math.max(viewW, viewH) * 0.5;
+    for (const s of stars) {
+      s.z -= warp * dt;
+      if (s.z < 0.06) newStar(s, false);
+      const near = 1 - s.z;
+      const px = cx + (s.x / s.z) * F * 0.55, py = cy + (s.y / s.z) * F * 0.55;
+      if (px < -4 || px > viewW + 4 || py < -4 || py > viewH + 4) continue;
+      const tw = reducedMotion ? 1 : 0.25 + 0.75 * (0.5 + 0.5 * Math.sin(t * s.twf + s.tw));
+      const fadeIn = Math.min(1, (1 - s.z) * 6);
+      g2d.fillStyle = `rgba(200,222,255,${Math.min(1, (0.18 + 0.75 * near) * tw * fadeIn)})`;
+      g2d.beginPath();
+      g2d.arc(px, py, s.size * (0.35 + near * 1.3), 0, Math.PI * 2);
+      g2d.fill();
+    }
+  }
+
+  const breathe = reducedMotion ? 0.5 : 0.5 + 0.5 * Math.sin(t * 1.4);
+  const R = Math.min(viewW, viewH * 1.15) * (0.20 + level * 0.04 + breathe * 0.008);
+  const rgb = colourSel.value.split(",").map(Number);
+  vorbDraw(g2d, cx, cy, R, nowMs, rgb, level, breathe);
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
